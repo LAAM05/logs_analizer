@@ -1,5 +1,5 @@
 # logs_analizer
-script en Python que te permita procesar múltiples archivos de logs Squid con el formato que nos diste, y generar reportes
+script en Python que te permita procesar múltiples archivos de logs Squid con el formato " *<timestamp> <client_ip> - - [<fecha:hora>] "<método URL protocolo>" <código_HTTP> <tamaño_respuesta> <acción> <destino> <cliente> <tipo_contenido> - <método TCP_DENIED/HIER_NONE ...>* ", y generar reportes
 
 ✅ Objetivos del script
 Identificar la cantidad de usuarios únicos
