@@ -1,120 +1,173 @@
-import os, re
-from datetime import datetime
-from collections import defaultdict,Counter
+import os
+import re
+from datetime import datetime, timezone
+from collections import defaultdict, Counter
 import pandas as pd
 
 LOG_DIR = 'logs'
 OUTPUT_DIR = 'output'
 
-# Expresión regular para parsear cada línea del log
-LOG_REGEX = re.compile(
-    r'^(?P<timestamp>\d+\.\d+)\s+'
-    r'(?P<ip>\d+\.\d+\.\d+\.\d+)\s+'
-    r'-\s+-\s+$$'
-    r'(?P<date>[^$$]+)'
-    r'$$\s+"'
-    r'(?P<method>\w+)\s+'
-    r'(?P<url>(?:https?://)?[^ ]+)'
-    r'\s+HTTP/\d\.\d"\s+'
-    r'(?P<status>\d+)\s+'
-    r'(?P<size>\d+)'
-)
+# Patrones regex para los formatos de log observados
+LOG_PATTERNS = [
+    # Formato 1: [timestamp] [duración] [ip] [cache]/[status] [size] [método] [url]
+    re.compile(
+        r'^(?P<timestamp>\d+\.\d+)\s+'
+        r'(?P<duration>\d+)\s+'
+        r'(?P<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+'
+        r'(?P<cache_status>\S+)/(?P<status>\d+)\s+'
+        r'(?P<size>\d+)\s+'
+        r'(?P<method>\S+)\s+'
+        r'(?P<url>\S+)\s+'
+    ),
+    # Formato 2: [timestamp] [ip] - [usuario] [fecha] "[método] [url] HTTP/..." [status] [size]
+    re.compile(
+        r'^(?P<timestamp>\d+\.\d+)\s+'
+        r'(?P<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+'
+        r'-\s+'
+        r'(?P<user>\S+)\s+'
+        r'\[(?P<date>.+?)\]\s+'
+        r'"(?P<method>\S+)\s+'
+        r'(?P<url>\S+)\s+'
+        r'HTTP/\d\.\d"\s+'
+        r'(?P<status>\d+)\s+'
+        r'(?P<size>\d+)\s+'
+    ),
+    # Formato 3: Líneas de error
+    re.compile(
+        r'^(?P<timestamp>\d+\.\d+)\s+'
+        r'(?P<duration>\d+)\s+'
+        r'(?P<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+'
+        r'(?P<cache_status>\S+)/(?P<status>\d+)\s+'
+        r'(?P<size>\d+)\s+'
+        r'-'
+    )
+]
 
 def parse_log_file(file_path):
     domains_counter = Counter()
-    traffic_data = defaultdict(int)
     users = set()
+    traffic_per_ip = defaultdict(int)
 
     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
-            match = LOG_REGEX.match(line.strip())
-            if not match:
+            line = line.strip()
+            if not line:
                 continue
 
-            data = match.groupdict()
-
-            # Parsear fecha y hora
-            date_str = data['date']
-            try:
-                dt = datetime.strptime(date_str, "%d/%b/%Y:%H:%M:%S %z")
-            except ValueError:
+            data = None
+            for pattern in LOG_PATTERNS:
+                match = pattern.match(line)
+                if match:
+                    data = match.groupdict()
+                    break
+            
+            if not data:
                 continue
 
+            # Obtener IP y tamaño
             ip = data['ip']
-            size = int(data['size'])
-            url = data['url']
+            try:
+                size = int(data.get('size', '0'))
+            except ValueError:
+                size = 0
+            traffic_per_ip[ip] += size
+            users.add(ip)
 
-            # Extraer dominio
-            domain_match = re.search(r'(?:https?://)?([^/]+)', url)
-            domain = domain_match.group(1) if domain_match else url
+            # Determinar fecha
+            dt = None
+            if 'date' in data:
+                try:
+                    dt = datetime.strptime(data['date'], "%d/%b/%Y:%H:%M:%S %z")
+                except ValueError:
+                    pass
+            if not dt and 'timestamp' in data:
+                try:
+                    ts = float(data['timestamp'])
+                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                except ValueError:
+                    continue
+            if not dt:
+                continue
+
+            # Extraer dominio de la URL
+            url = data.get('url', '')
+            if not url:
+                continue
+
+            # Manejar URLs de tipo CONNECT: "dominio:puerto"
+            domain = url.split(':')[0] if data.get('method') == 'CONNECT' else url
+            
+            # Extraer dominio limpio (sin protocolo ni puerto)
+            domain_match = re.search(r'(?:https?://)?([^/:]+)', domain)
+            if domain_match:
+                domain = domain_match.group(1).lower()
+            else:
+                domain = domain.lower()
 
             # Agrupar por año y mes
             year_month = f"{dt.year}_{dt.strftime('%b').lower()}"
-
-            # Contadores
             domains_counter[(year_month, domain)] += 1
-            traffic_data[ip] += size
-            users.add(ip)
 
     return {
         'domains': domains_counter,
-        'traffic': traffic_data,
-        'users': users
+        'users': users,
+        'traffic': traffic_per_ip
     }
 
 def process_all_logs():
     all_domains = Counter()
-    total_traffic = 0
     all_users = set()
     monthly_domains = defaultdict(Counter)
+    total_traffic = 0
 
     for filename in os.listdir(LOG_DIR):
+        if filename.startswith('.'):
+            continue
         file_path = os.path.join(LOG_DIR, filename)
-        print(f"[+] Procesando archivo: {filename}")
-        parsed = parse_log_file(file_path)
-
-        # Usuarios
-        all_users.update(parsed['users'])
-
-        # Tráfico total
-        total_traffic += sum(parsed['traffic'].values())
-
-        # Dominios por mes
-        for (month_domain, count) in parsed['domains'].items():
-            month, domain = month_domain
-            all_domains[domain] += count
-            monthly_domains[month][domain] += count
+        print(f"[+] Procesando: {filename}")
+        try:
+            parsed = parse_log_file(file_path)
+            all_users.update(parsed['users'])
+            
+            for (month_domain, count) in parsed['domains'].items():
+                month, domain = month_domain
+                all_domains[domain] += count
+                monthly_domains[month][domain] += count
+            
+            total_traffic += sum(parsed['traffic'].values())
+        except Exception as e:
+            print(f"  [!] Error en {filename}: {str(e)}")
 
     # Guardar resultados
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # 1. Usuarios
+    
+    # 1. Usuarios únicos
     with open(os.path.join(OUTPUT_DIR, 'usuarios.txt'), 'w') as f:
         f.write(f"Usuarios únicos: {len(all_users)}\n")
-        f.write("Lista:\n")
-        for user in sorted(all_users):
-            f.write(f"- {user}\n")
-
+        f.write("Lista:\n" + "\n".join(f"- {ip}" for ip in sorted(all_users)))
+    
     # 2. Tráfico total
     with open(os.path.join(OUTPUT_DIR, 'trafico_total.txt'), 'w') as f:
+        total_mb = total_traffic / (1024 ** 2)
         f.write(f"Tráfico total: {total_traffic} bytes\n")
-        f.write(f"Tráfico total aproximado: {round(total_traffic / (1024 ** 2), 2)} MB\n")
-
+        f.write(f"Tráfico total aproximado: {total_mb:.2f} MB\n")
+    
     # 3. Top 500 por mes
-    os.makedirs(os.path.join(OUTPUT_DIR, 'top_500_por_mes'), exist_ok=True)
+    top_mes_dir = os.path.join(OUTPUT_DIR, 'top_500_por_mes')
+    os.makedirs(top_mes_dir, exist_ok=True)
     for month, counter in monthly_domains.items():
-        top_list = counter.most_common(500)
-        df = pd.DataFrame(top_list, columns=['Dominio', 'Accesos'])
-        df.to_csv(os.path.join(OUTPUT_DIR, 'top_500_por_mes', f'{month}.csv'), index=False)
-
-    # Top global (opcional)
+        top_domains = counter.most_common(500)
+        df = pd.DataFrame(top_domains, columns=['Dominio', 'Accesos'])
+        df.to_csv(os.path.join(top_mes_dir, f'{month}.csv'), index=False)
+    
+    # Top 500 global
     df_global = pd.DataFrame(all_domains.most_common(500), columns=['Dominio', 'Accesos'])
     df_global.to_csv(os.path.join(OUTPUT_DIR, 'top_500_global.csv'), index=False)
 
     print("\n✅ Análisis completado:")
     print(f"- Usuarios únicos: {len(all_users)}")
-    print(f"- Tráfico total: {round(total_traffic / (1024 ** 2), 2)} MB")
-    print(f"- Archivos guardados en '{OUTPUT_DIR}'")
+    print(f"- Tráfico total: {total_traffic / (1024 ** 2):.2f} MB")
+    print(f"- Resultados en: {OUTPUT_DIR}")
 
 if __name__ == '__main__':
     process_all_logs()
